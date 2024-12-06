@@ -8,6 +8,10 @@ from datetime import datetime
 import json
 import httpx
 
+# Lyzr Credientials
+Lyzr_API_KEY = "LYZR_API";
+Lyzr_AGENT_ID = "6750b99261f92e3cfef1bb25";
+Lyzr_BASE_URL = "https://agent.api.lyzr.app/v2/chat/";
 # Initialize FastAPI
 app = FastAPI()
 
