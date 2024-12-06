@@ -214,7 +214,30 @@ async def make_api_request(client: httpx.AsyncClient, url: str, headers: dict, p
         logger.error(f"Response: {response.text}")
         raise httpx.HTTPError(f"API request failed with status {response.status_code}")
     
-    return response.json()
+    try:
+        response_json = response.json()
+        logger.debug(f"Raw API response for {asset_type}: {response_json}")
+        
+        # Extract content from the response
+        if 'choices' in response_json and len(response_json['choices']) > 0:
+            content = response_json['choices'][0]['message']['content']
+            logger.debug(f"Content for {asset_type}: {content}")
+            
+            # Try to parse the content as JSON
+            try:
+                return json.loads(content)
+            except json.JSONDecodeError as e:
+                logger.error(f"Failed to parse content as JSON for {asset_type}: {e}")
+                logger.error(f"Content was: {content}")
+                raise
+        else:
+            logger.error(f"Invalid response structure for {asset_type}: {response_json}")
+            raise ValueError("Invalid response structure")
+            
+    except json.JSONDecodeError as e:
+        logger.error(f"Failed to parse API response for {asset_type}: {e}")
+        logger.error(f"Response text was: {response.text}")
+        raise
 
 async def get_market_analysis(asset_type: str) -> Dict:
     """Get market analysis with fallback mechanism"""
@@ -272,14 +295,14 @@ async def get_market_analysis(asset_type: str) -> Dict:
             "messages": [
                 {
                     "role": "system",
-                    "content": """Financial analyst. Respond with concise JSON only:
-                    {
-                        "trend": "brief current trend",
-                        "outlook": "brief outlook",
-                        "factors": ["2-3 key points"],
-                        "risks": ["2-3 risks"],
-                        "picks": [{"name": "option", "why": "brief why"}]
-                    }"""
+                    "content": """You are a financial analyst. Respond with ONLY a valid JSON object, no additional text or formatting. Always use this exact structure:
+{
+"trend": "brief market trend description",
+"outlook": "brief future outlook",
+"factors": ["key factor 1", "key factor 2"],
+"risks": ["risk 1", "risk 2"],
+"picks": [{"name": "investment name", "why": "brief rationale"}]
+}"""
                 },
                 {"role": "user", "content": query}
             ]
