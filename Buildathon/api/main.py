@@ -9,6 +9,9 @@ from datetime import datetime
 import json
 import httpx
 import logging
+import re
+import asyncio
+from tenacity import retry, stop_after_attempt, wait_exponential
 
 # Configure logging
 logging.basicConfig(
@@ -199,72 +202,19 @@ def get_default_market_data(asset_type: str) -> Dict:
         "top_picks": [{"name": "Data unavailable", "symbol": "N/A", "performance": "N/A"}]
     }
 
-async def get_real_time_market_data(asset_type: str) -> Dict:
-    """Fetch real-time market data using Perplexity API"""
-    url = "https://api.perplexity.ai/chat/completions"
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
+async def make_api_request(client: httpx.AsyncClient, url: str, headers: dict, payload: dict, asset_type: str):
+    """Make API request with retry mechanism"""
+    logger.info(f"\n-> Sending request for {asset_type}...")
+    response = await client.post(url, json=payload, headers=headers, timeout=60.0)
+    logger.info(f"<- Received response for {asset_type} (Status: {response.status_code})")
     
-    queries = {
-        "Stocks": "Analyze current Indian stock market conditions including Nifty50, top performing stocks, and market trends.",
-        "Mutual_Funds": "List top performing mutual funds in India with their current returns and trends.",
-        "ETFs": "Analyze popular ETFs in India including their performance and market trends."
-    }
+    if response.status_code != 200:
+        logger.error(f"API error for {asset_type}: Status {response.status_code}")
+        logger.error(f"Response: {response.text}")
+        raise httpx.HTTPError(f"API request failed with status {response.status_code}")
     
-    payload = {
-        "model": "llama-3.1-sonar-small-128k-online",
-        "messages": [
-            {
-                "role": "system",
-                "content": "You are a financial analyst. Provide a concise market analysis."
-            },
-            {
-                "role": "user",
-                "content": queries.get(asset_type, f"Analyze {asset_type} market in India")
-            }
-        ],
-        "temperature": 0.2
-    }
-    
-    headers = {
-        "Authorization": f"Bearer {PERPLEXITY_API_KEY}",
-        "Content-Type": "application/json"
-    }
-    
-    try:
-        async with httpx.AsyncClient() as client:
-            response = await client.post(url, json=payload, headers=headers)
-            if response.status_code == 200:
-                return response.json()
-            else:
-                logger.error(f"Perplexity API error: {response.status_code}")
-                return get_default_market_data(asset_type)
-    except Exception as e:
-        logger.error(f"Error in get_real_time_market_data: {str(e)}")
-        return get_default_market_data(asset_type)
-
-def structure_market_data(raw_data: Dict, asset_type: str) -> Dict:
-    """Structure market data using OpenAI"""
-    try:
-        prompt = f"""Structure the following market analysis for {asset_type} into a JSON format with:
-        - current_trend (string)
-        - outlook (string)
-        - key_factors (list of strings)
-        - risks (list of strings)
-        - top_picks (list of objects with name, symbol, performance)
-        
-        Data: {json.dumps(raw_data)}"""
-        
-        response = client.chat.completions.create(
-            model="gpt-4",
-            messages=[
-                {"role": "system", "content": "You are a financial data structuring assistant."},
-                {"role": "user", "content": prompt}
-            ]
-        )
-        
-        return json.loads(response.choices[0].message.content)
-    except Exception as e:
-        logger.error(f"Error in structure_market_data: {str(e)}")
-        return get_default_market_data(asset_type)
+    return response.json()
 
 async def get_market_analysis(asset_type: str) -> Dict:
     """Get market analysis with fallback mechanism"""
@@ -273,9 +223,6 @@ async def get_market_analysis(asset_type: str) -> Dict:
             logger.warning("No Perplexity API key found, using fallback data")
             return get_fallback_market_analysis(asset_type)
 
-        logger.info(f"\n{'='*50}")
-        logger.info(f"Starting analysis for {asset_type}")
-        logger.info(f"Using Perplexity API key: {PERPLEXITY_API_KEY[:10]}...")
         url = "https://api.perplexity.ai/chat/completions"
         
         headers = {
@@ -284,141 +231,89 @@ async def get_market_analysis(asset_type: str) -> Dict:
         }
         
         queries = {
-            "Stocks": """Analyze current Indian stock market conditions. Include:
-                1. Current market trend and sentiment
-                2. Key market indices performance
-                3. Top performing sectors
-                4. Recommended large-cap and mid-cap stocks
-                Format as JSON with: current_trend, outlook, key_factors, risks, specific_suggestions""",
-            "Mutual_Funds": """Analyze current Indian mutual fund market. Include:
-                1. Top performing fund categories
-                2. Best rated mutual funds
-                3. Risk factors and outlook
-                4. Specific fund recommendations
-                Format as JSON with: current_trend, outlook, key_factors, risks, specific_suggestions""",
-            "Bonds": """Analyze current Indian bond market conditions. Include:
-                1. Interest rate environment
-                2. Government and corporate bond performance
-                3. Key risk factors
-                4. Specific bond recommendations
-                Format as JSON with: current_trend, outlook, key_factors, risks, specific_suggestions""",
-            "Gold": """Analyze current gold market conditions. Include:
-                1. Price trends and outlook
-                2. Key factors affecting gold prices
-                3. Investment options in gold
-                4. Specific recommendations for gold investments
-                Format as JSON with: current_trend, outlook, key_factors, risks, specific_suggestions"""
+            "Stocks": """Analyze Indian stock market. Format as JSON:
+                {
+                    "trend": "current market trend",
+                    "outlook": "brief future outlook",
+                    "factors": ["2-3 key factors"],
+                    "risks": ["2-3 main risks"],
+                    "picks": [{"name": "investment name", "why": "brief rationale"}]
+                }""",
+            "Mutual_Funds": """Analyze Indian mutual funds. Format as JSON:
+                {
+                    "trend": "current fund performance",
+                    "outlook": "brief future outlook",
+                    "factors": ["2-3 key factors"],
+                    "risks": ["2-3 main risks"],
+                    "picks": [{"name": "fund name", "why": "brief rationale"}]
+                }""",
+            "Bonds": """Analyze Indian bond market. Format as JSON:
+                {
+                    "trend": "current yield trends",
+                    "outlook": "brief future outlook",
+                    "factors": ["2-3 key factors"],
+                    "risks": ["2-3 main risks"],
+                    "picks": [{"name": "bond type", "why": "brief rationale"}]
+                }""",
+            "Gold": """Analyze gold market. Format as JSON:
+                {
+                    "trend": "current price trend",
+                    "outlook": "brief future outlook",
+                    "factors": ["2-3 key factors"],
+                    "risks": ["2-3 main risks"],
+                    "picks": [{"name": "investment type", "why": "brief rationale"}]
+                }"""
         }
         
-        query = queries.get(asset_type, f"Analyze {asset_type} market in India")
+        query = queries.get(asset_type, f"Analyze {asset_type} market")
         
         payload = {
-            "model": "llama-3.1-sonar-small-128k-online",
+            "model": "mistral-7b-instruct",
             "messages": [
                 {
                     "role": "system",
-                    "content": """You are a financial analyst. Provide analysis in this exact JSON format:
+                    "content": """Financial analyst. Respond with concise JSON only:
                     {
-                        "current_trend": "string",
-                        "outlook": "string",
-                        "key_factors": ["string"],
-                        "risks": ["string"],
-                        "specific_suggestions": [
-                            {
-                                "name": "string",
-                                "ticker": "string",
-                                "rationale": "string"
-                            }
-                        ]
+                        "trend": "brief current trend",
+                        "outlook": "brief outlook",
+                        "factors": ["2-3 key points"],
+                        "risks": ["2-3 risks"],
+                        "picks": [{"name": "option", "why": "brief why"}]
                     }"""
                 },
                 {"role": "user", "content": query}
             ]
         }
         
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            logger.info(f"\n--- Making API request for {asset_type} ---")
-            logger.info(f"Request URL: {url}")
-            logger.info(f"Request Headers: {headers}")
-            logger.info(f"Request Payload: {json.dumps(payload, indent=2)}")
-            
+        async with httpx.AsyncClient() as client:
             try:
-                logger.info(f"\n-> Sending request for {asset_type}...")
-                response = await client.post(url, json=payload, headers=headers)
-                logger.info(f"<- Received response for {asset_type} (Status: {response.status_code})")
+                result = await make_api_request(client, url, headers, payload, asset_type)
                 
-                if response.status_code == 200:
-                    result = response.json()
-                    logger.info(f"\n=== Processing response for {asset_type} ===")
-                    if 'choices' in result and len(result['choices']) > 0:
-                        content = result['choices'][0]['message']['content']
-                        try:
-                            logger.info(f"\nRaw content for {asset_type}:")
-                            logger.debug(content)
-                            
-                            # Strip markdown code blocks if present
-                            content = content.strip()
-                            if content.startswith('```json'):
-                                content = content[7:]  # Remove ```json
-                                logger.info(f"Removed ```json prefix for {asset_type}")
-                            if content.endswith('```'):
-                                content = content[:-3]  # Remove ```
-                                logger.info(f"Removed ``` suffix for {asset_type}")
-                            content = content.strip()  # Remove any extra whitespace
-                            
-                            # Clean up citations in the content
-                            import re
-                            content = re.sub(r'\[\d+\]', '', content)  # Remove citation references like [3], [4]
-                            logger.info(f"\nCleaned content for {asset_type}:")
-                            logger.debug(content)  # Use debug level for large content
-                            
-                            logger.info(f"\nParsing JSON for {asset_type}...")
-                            market_data = json.loads(content)
-                            logger.info(f"Successfully parsed JSON for {asset_type}")
-                            logger.info(f"Market data: {json.dumps(market_data, indent=2)}")
-                            
-                            required_keys = ['current_trend', 'outlook', 'key_factors', 'risks', 'specific_suggestions']
-                            if all(key in market_data for key in required_keys):
-                                logger.info(f"All required keys present for {asset_type}")
-                                if isinstance(market_data['specific_suggestions'], list):
-                                    for suggestion in market_data['specific_suggestions']:
-                                        if not all(key in suggestion for key in ['name', 'ticker', 'rationale']):
-                                            logger.error(f"Invalid suggestion format in {asset_type}: {suggestion}")
-                                            raise ValueError(f"Invalid suggestion format in {asset_type}")
-                                    logger.info(f"Successfully validated {asset_type} data")
-                                    return market_data
-                            else:
-                                logger.error(f"Missing required keys in {asset_type} data")
-                            
-                            logger.error(f"Invalid data structure from API for {asset_type}")
-                        except json.JSONDecodeError as e:
-                            logger.error(f"\nJSON parsing error for {asset_type}: {str(e)}")
-                            logger.error(f"Problematic content for {asset_type}:")
-                            logger.error(content)
-                        except Exception as e:
-                            logger.error(f"\nError processing market data for {asset_type}: {str(e)}")
-                            logger.error(f"Problematic content for {asset_type}:")
-                            logger.error(content)
-                else:
-                    logger.error(f"\nAPI error for {asset_type}:")
-                    logger.error(f"Status code: {response.status_code}")
-                    logger.error(f"Response text: {response.text}")
-                    logger.error(f"Response headers: {response.headers}")
-            except httpx.TimeoutException:
-                logger.error(f"\nRequest timeout for {asset_type} after 30 seconds")
+                if 'choices' in result and len(result['choices']) > 0:
+                    content = result['choices'][0]['message']['content']
+                    analysis = json.loads(content)
+                    
+                    # Map the new format to the expected format
+                    return {
+                        "current_trend": analysis["trend"],
+                        "outlook": analysis["outlook"],
+                        "key_factors": analysis["factors"],
+                        "risks": analysis["risks"],
+                        "specific_suggestions": [
+                            {"name": pick["name"], "ticker": "N/A", "rationale": pick["why"]}
+                            for pick in analysis["picks"]
+                        ]
+                    }
+                
+                logger.error(f"Invalid response format for {asset_type}")
+                return get_fallback_market_analysis(asset_type)
+                
             except Exception as e:
-                logger.error(f"\nRequest error for {asset_type}: {str(e)}")
-                import traceback
-                logger.error(f"Full error traceback for {asset_type}:")
-                logger.error(traceback.format_exc())
-            
-            logger.info(f"\nFalling back to default market analysis for {asset_type}")
-            return get_fallback_market_analysis(asset_type)
+                logger.error(f"Error in API request for {asset_type}: {str(e)}")
+                return get_fallback_market_analysis(asset_type)
+                
     except Exception as e:
-        logger.error(f"\nUnexpected error in get_market_analysis for {asset_type}: {str(e)}")
-        import traceback
-        logger.error(f"Full error traceback for {asset_type}:")
-        logger.error(traceback.format_exc())
+        logger.error(f"Error in get_market_analysis: {str(e)}")
         return get_fallback_market_analysis(asset_type)
 
 def get_investment_recommendations(market_data: Dict, risk_profile: str) -> List[Dict]:
@@ -450,7 +345,7 @@ def get_investment_recommendations(market_data: Dict, risk_profile: str) -> List
                     ]
                 elif asset_type == "Bonds":
                     specific_suggestions = [
-                        {"name": "Government Bonds", "ticker": "Various", "rationale": "Safe, guaranteed returns"},
+                        {"name": "Government Securities", "ticker": "Various", "rationale": "Safe, guaranteed returns"},
                         {"name": "Corporate Bonds", "ticker": "Various", "rationale": "Higher yields with moderate risk"}
                     ]
                 elif asset_type == "Gold":
@@ -551,20 +446,25 @@ def get_default_recommendations(risk_profile: str) -> List[Dict]:
 async def analyze_portfolio(user_data: UserProfile) -> PortfolioRecommendation:
     """Analyze user profile and generate portfolio recommendations."""
     try:
-        logger.info("\nStarting portfolio analysis...")
-        logger.info(f"User profile: {user_data.dict()}")
+        logger.info("Starting portfolio analysis...")
         market_analysis = {}
         for asset_type in ["Stocks", "Mutual_Funds", "Bonds", "Gold"]:
             market_analysis[asset_type] = await get_market_analysis(asset_type)
         
         recommendations = get_investment_recommendations(market_analysis, user_data.risk_tolerance)
         
+        # Generate concise explanation
         explanation = (
-            f"Based on your {user_data.risk_tolerance} risk profile and current market conditions, "
-            f"we have prepared a personalized investment portfolio recommendation. "
-            f"The allocation considers your investment horizon of {user_data.investment_horizon} "
-            f"and comfort with fluctuations level of {user_data.comfort_with_fluctuations}."
+            f"{user_data.risk_tolerance} risk profile - {user_data.investment_horizon} horizon. "
+            f"Comfort level: {user_data.comfort_with_fluctuations}/10\n\n"
+            "Market Summary:\n"
         )
+        
+        # Add key market insights
+        for asset_type, analysis in market_analysis.items():
+            explanation += f"\n{asset_type}:\n"
+            explanation += f"• {analysis['current_trend']}\n"
+            explanation += f"• Outlook: {analysis['outlook']}"
         
         review_schedule = "Quarterly" if user_data.investment_horizon == "Short" else "Semi-annually"
         
@@ -573,11 +473,7 @@ async def analyze_portfolio(user_data: UserProfile) -> PortfolioRecommendation:
             recommendations=recommendations,
             market_analysis=market_analysis,
             review_schedule=review_schedule,
-            disclaimer=(
-                "This recommendation is based on current market conditions and your profile. "
-                "Past performance is not indicative of future results. "
-                "Please consult with a financial advisor before making investment decisions."
-            )
+            disclaimer="Past performance not indicative of future results. Consult financial advisor before investing."
         )
         
         return portfolio
