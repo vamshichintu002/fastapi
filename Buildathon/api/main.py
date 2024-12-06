@@ -268,7 +268,7 @@ async def get_market_analysis(asset_type: str) -> Dict:
         query = queries.get(asset_type, f"Analyze {asset_type} market")
         
         payload = {
-            "model": "mistral-7b-instruct",
+            "model": "llama-3.1-sonar-small-128k-online",  # Changed from mistral-7b-instruct to pplx-7b-online
             "messages": [
                 {
                     "role": "system",
