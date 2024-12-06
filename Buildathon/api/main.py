@@ -2,16 +2,25 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from typing import List, Optional, Dict, Any
 import os
+from dotenv import load_dotenv
 from openai import OpenAI
 import requests
 from datetime import datetime
 import json
 import httpx
+import logging
 
-# Lyzr Credientials
-Lyzr_API_KEY = "LYZR_API";
-Lyzr_AGENT_ID = "6750b99261f92e3cfef1bb25";
-Lyzr_BASE_URL = "https://agent.api.lyzr.app/v2/chat/";
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+
+logger = logging.getLogger(__name__)
+
+# Load environment variables from .env file
+load_dotenv()
+
 # Initialize FastAPI
 app = FastAPI()
 
@@ -19,13 +28,16 @@ app = FastAPI()
 def init_openai():
     api_key = os.getenv("OPENAI_API_KEY")
     if not api_key:
-        print("Warning: OPENAI_API_KEY not found in environment variables")
+        logger.warning("Warning: OPENAI_API_KEY not found in environment variables")
         return None
+    logger.info(f"Initializing OpenAI client with key: {api_key[:10]}...")
     return OpenAI(api_key=api_key)
 
 PERPLEXITY_API_KEY = os.getenv("PERPLEXITY_API_KEY")
 if not PERPLEXITY_API_KEY:
-    print("Warning: PERPLEXITY_API_KEY not found in environment variables")
+    logger.warning("Warning: PERPLEXITY_API_KEY not found in environment variables")
+else:
+    logger.info(f"Loaded Perplexity API key: {PERPLEXITY_API_KEY[:10]}...")
 
 client = init_openai()
 
@@ -223,10 +235,10 @@ async def get_real_time_market_data(asset_type: str) -> Dict:
             if response.status_code == 200:
                 return response.json()
             else:
-                print(f"Perplexity API error: {response.status_code}")
+                logger.error(f"Perplexity API error: {response.status_code}")
                 return get_default_market_data(asset_type)
     except Exception as e:
-        print(f"Error in get_real_time_market_data: {str(e)}")
+        logger.error(f"Error in get_real_time_market_data: {str(e)}")
         return get_default_market_data(asset_type)
 
 def structure_market_data(raw_data: Dict, asset_type: str) -> Dict:
@@ -251,17 +263,21 @@ def structure_market_data(raw_data: Dict, asset_type: str) -> Dict:
         
         return json.loads(response.choices[0].message.content)
     except Exception as e:
-        print(f"Error in structure_market_data: {str(e)}")
+        logger.error(f"Error in structure_market_data: {str(e)}")
         return get_default_market_data(asset_type)
 
 async def get_market_analysis(asset_type: str) -> Dict:
     """Get market analysis with fallback mechanism"""
     try:
         if not PERPLEXITY_API_KEY:
-            print("No Perplexity API key found, using fallback data")
+            logger.warning("No Perplexity API key found, using fallback data")
             return get_fallback_market_analysis(asset_type)
 
+        logger.info(f"\n{'='*50}")
+        logger.info(f"Starting analysis for {asset_type}")
+        logger.info(f"Using Perplexity API key: {PERPLEXITY_API_KEY[:10]}...")
         url = "https://api.perplexity.ai/chat/completions"
+        
         headers = {
             "Authorization": f"Bearer {PERPLEXITY_API_KEY}",
             "Content-Type": "application/json"
@@ -317,36 +333,92 @@ async def get_market_analysis(asset_type: str) -> Dict:
                     }"""
                 },
                 {"role": "user", "content": query}
-            ],
-            "temperature": 0.3
+            ]
         }
         
-        async with httpx.AsyncClient() as client:
-            response = await client.post(url, json=payload, headers=headers)
-            if response.status_code == 200:
-                result = response.json()
-                if 'choices' in result and len(result['choices']) > 0:
-                    content = result['choices'][0]['message']['content']
-                    try:
-                        market_data = json.loads(content)
-                        
-                        required_keys = ['current_trend', 'outlook', 'key_factors', 'risks', 'specific_suggestions']
-                        if all(key in market_data for key in required_keys):
-                            if isinstance(market_data['specific_suggestions'], list):
-                                for suggestion in market_data['specific_suggestions']:
-                                    if not all(key in suggestion for key in ['name', 'ticker', 'rationale']):
-                                        raise ValueError("Invalid suggestion format")
-                                return market_data
-                        
-                        print(f"Invalid data structure from API for {asset_type}")
-                    except (json.JSONDecodeError, ValueError) as e:
-                        print(f"Error parsing API response for {asset_type}: {str(e)}")
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            logger.info(f"\n--- Making API request for {asset_type} ---")
+            logger.info(f"Request URL: {url}")
+            logger.info(f"Request Headers: {headers}")
+            logger.info(f"Request Payload: {json.dumps(payload, indent=2)}")
             
-            print(f"Falling back to default market analysis for {asset_type}")
+            try:
+                logger.info(f"\n-> Sending request for {asset_type}...")
+                response = await client.post(url, json=payload, headers=headers)
+                logger.info(f"<- Received response for {asset_type} (Status: {response.status_code})")
+                
+                if response.status_code == 200:
+                    result = response.json()
+                    logger.info(f"\n=== Processing response for {asset_type} ===")
+                    if 'choices' in result and len(result['choices']) > 0:
+                        content = result['choices'][0]['message']['content']
+                        try:
+                            logger.info(f"\nRaw content for {asset_type}:")
+                            logger.debug(content)
+                            
+                            # Strip markdown code blocks if present
+                            content = content.strip()
+                            if content.startswith('```json'):
+                                content = content[7:]  # Remove ```json
+                                logger.info(f"Removed ```json prefix for {asset_type}")
+                            if content.endswith('```'):
+                                content = content[:-3]  # Remove ```
+                                logger.info(f"Removed ``` suffix for {asset_type}")
+                            content = content.strip()  # Remove any extra whitespace
+                            
+                            # Clean up citations in the content
+                            import re
+                            content = re.sub(r'\[\d+\]', '', content)  # Remove citation references like [3], [4]
+                            logger.info(f"\nCleaned content for {asset_type}:")
+                            logger.debug(content)  # Use debug level for large content
+                            
+                            logger.info(f"\nParsing JSON for {asset_type}...")
+                            market_data = json.loads(content)
+                            logger.info(f"Successfully parsed JSON for {asset_type}")
+                            logger.info(f"Market data: {json.dumps(market_data, indent=2)}")
+                            
+                            required_keys = ['current_trend', 'outlook', 'key_factors', 'risks', 'specific_suggestions']
+                            if all(key in market_data for key in required_keys):
+                                logger.info(f"All required keys present for {asset_type}")
+                                if isinstance(market_data['specific_suggestions'], list):
+                                    for suggestion in market_data['specific_suggestions']:
+                                        if not all(key in suggestion for key in ['name', 'ticker', 'rationale']):
+                                            logger.error(f"Invalid suggestion format in {asset_type}: {suggestion}")
+                                            raise ValueError(f"Invalid suggestion format in {asset_type}")
+                                    logger.info(f"Successfully validated {asset_type} data")
+                                    return market_data
+                            else:
+                                logger.error(f"Missing required keys in {asset_type} data")
+                            
+                            logger.error(f"Invalid data structure from API for {asset_type}")
+                        except json.JSONDecodeError as e:
+                            logger.error(f"\nJSON parsing error for {asset_type}: {str(e)}")
+                            logger.error(f"Problematic content for {asset_type}:")
+                            logger.error(content)
+                        except Exception as e:
+                            logger.error(f"\nError processing market data for {asset_type}: {str(e)}")
+                            logger.error(f"Problematic content for {asset_type}:")
+                            logger.error(content)
+                else:
+                    logger.error(f"\nAPI error for {asset_type}:")
+                    logger.error(f"Status code: {response.status_code}")
+                    logger.error(f"Response text: {response.text}")
+                    logger.error(f"Response headers: {response.headers}")
+            except httpx.TimeoutException:
+                logger.error(f"\nRequest timeout for {asset_type} after 30 seconds")
+            except Exception as e:
+                logger.error(f"\nRequest error for {asset_type}: {str(e)}")
+                import traceback
+                logger.error(f"Full error traceback for {asset_type}:")
+                logger.error(traceback.format_exc())
+            
+            logger.info(f"\nFalling back to default market analysis for {asset_type}")
             return get_fallback_market_analysis(asset_type)
-            
     except Exception as e:
-        print(f"Error getting market analysis for {asset_type}: {str(e)}")
+        logger.error(f"\nUnexpected error in get_market_analysis for {asset_type}: {str(e)}")
+        import traceback
+        logger.error(f"Full error traceback for {asset_type}:")
+        logger.error(traceback.format_exc())
         return get_fallback_market_analysis(asset_type)
 
 def get_investment_recommendations(market_data: Dict, risk_profile: str) -> List[Dict]:
@@ -402,7 +474,7 @@ def get_investment_recommendations(market_data: Dict, risk_profile: str) -> List
         return recommendations
 
     except Exception as e:
-        print(f"Error generating recommendations: {str(e)}")
+        logger.error(f"Error generating recommendations: {str(e)}")
         return get_default_recommendations(risk_profile)
 
 def get_allocation_percentage(asset_type: str, risk_profile: str) -> float:
@@ -476,8 +548,11 @@ def get_default_recommendations(risk_profile: str) -> List[Dict]:
     ]
 
 @app.post("/analyze-portfolio", response_model=PortfolioRecommendation)
-async def analyze_portfolio(user_data: UserProfile):
+async def analyze_portfolio(user_data: UserProfile) -> PortfolioRecommendation:
+    """Analyze user profile and generate portfolio recommendations."""
     try:
+        logger.info("\nStarting portfolio analysis...")
+        logger.info(f"User profile: {user_data.dict()}")
         market_analysis = {}
         for asset_type in ["Stocks", "Mutual_Funds", "Bonds", "Gold"]:
             market_analysis[asset_type] = await get_market_analysis(asset_type)
@@ -508,7 +583,7 @@ async def analyze_portfolio(user_data: UserProfile):
         return portfolio
         
     except Exception as e:
-        print(f"Error in analyze_portfolio: {str(e)}")
+        logger.error(f"Error in analyze_portfolio: {str(e)}")
         raise HTTPException(
             status_code=500,
             detail=f"Error generating portfolio recommendation: {str(e)}"
@@ -516,4 +591,4 @@ async def analyze_portfolio(user_data: UserProfile):
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=8000,debug=True)
